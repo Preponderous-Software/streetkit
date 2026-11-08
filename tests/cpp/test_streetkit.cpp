@@ -518,6 +518,9 @@ static void testFiles() {
     CHECK(fromMemory.key == k && fromMemory.samples == t.samples && fromMemory.trees.size() == t.trees.size());
     CHECK(!streetkit::parseTile(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size() / 2, fromMemory, &err));
     CHECK(!streetkit::parseTile(reinterpret_cast<const uint8_t*>("not a tile at all"), 17, fromMemory, &err));
+    std::string ponderosaTile = bytes;   // the same bytes under Ponderosa's name for the format
+    ponderosaTile.replace(0, 8, "PDRTILE1");
+    CHECK(streetkit::parseTile(reinterpret_cast<const uint8_t*>(ponderosaTile.data()), ponderosaTile.size(), fromMemory, &err));
     streetkit::Manifest none;
     CHECK(!streetkit::parseManifest("nothing here", "tiles", none));
     CHECK(streetkit::parseManifest("old-town-walk-manifest 1\ntile_size 500\ntile 1 2\n", "tiles", none));

@@ -205,7 +205,9 @@ bool parseTile(const uint8_t* data, size_t size, Tile& t, std::string* error) {
     };
     Reader r{data, size};
     char magic[8];
-    if (!r.bytes(magic, 8) || std::memcmp(magic, "OTWTILE1", 8) != 0) return fail("not a tile");
+    // PDRTILE1 is the same layout under Ponderosa's name, so tiles it built before streetkit still load.
+    if (!r.bytes(magic, 8) || (std::memcmp(magic, "OTWTILE1", 8) != 0 && std::memcmp(magic, "PDRTILE1", 8) != 0))
+        return fail("not a tile");
     t = Tile{};
     if (r.get<uint32_t>() != 1) return fail("unsupported version");
     t.key.ix = r.get<int32_t>();

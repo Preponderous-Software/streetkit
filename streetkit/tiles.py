@@ -11,7 +11,8 @@ tile is; the viewer adds the offset when it loads one. Heights are metres above 
     footprint:= i32 points  x z f32
     tree     := x y z height crown r g b, f32
 
-Indices are u16 when the mesh has fewer than 65536 vertices.
+Indices are u16 when the mesh has fewer than 65536 vertices. Ponderosa wrote the same layout as "PDRTILE1", which
+the reader also accepts.
 """
 
 from __future__ import annotations
