@@ -1,0 +1,26 @@
+[project]
+name = "streetkit"
+version = "0.1.0"
+description = "Walkable 3D town maps from open data: OpenStreetMap, USGS elevation and lidar, streamed as tiles for Strata"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = ["numpy>=1.26", "pyproj>=3.6", "tifffile>=2024.1.30", "mapbox-earcut>=1.0"]
+
+[project.scripts]
+streetkit = "streetkit.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pillow>=10"]
+# Only for `streetkit lidar`, which reads a survey's compressed point tiles; builds read the committed grid.
+lidar = ["laspy[lazrs]>=2.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["streetkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

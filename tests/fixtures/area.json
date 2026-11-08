@@ -1,0 +1,8 @@
+{
+  "name": "fort-collins-old-town",
+  "centre_lat": 40.5877,
+  "centre_lon": -105.0761,
+  "tile_size_m": 500,
+  "tiles_across": 4,
+  "cell_m": 2
+}
