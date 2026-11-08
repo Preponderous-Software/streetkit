@@ -25,7 +25,9 @@ Collins.
 - **Whole cities.** An area can name an OpenStreetMap boundary instead of a square: its tiles are the ones within a
   margin of it, its map comes from a dated regional `.osm.pbf` extract (the `city` extra), its elevation is fetched
   in 5 km pieces and joined, and its raw data is pinned by URL and hash in `city/SOURCES.json` instead of committed.
-  Builds use every core, can write one tile in N to measure, and resume after an interruption.
+  Builds use every core, can write one tile in N to measure, and resume after an interruption. A city's lidar is
+  gridded in 5 km squares (`streetkit lidar` on a city area) from every USGS survey over each square, the newest
+  wherever it saw anything, and pinned by hash with the rest of its raw data.
 - **An overview.** With `overview_cell_m`, the whole area is also written at low resolution, and the C++ draws it as
   Strata's terrain under the tiles, so flight sees land all the way to the horizon.
 - **Tiles.** A global grid of UTM squares, each tile self-contained, with a manifest listing every tile by size and

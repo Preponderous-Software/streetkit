@@ -22,8 +22,16 @@ def window_max(h: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
-def treetops(lidar, built) -> list[tuple[float, float, float]]:
-    """(east, north, height) of every treetop the survey saw. `built(east, north)` masks out roofs."""
+def treetops(lidar, built) -> list[tuple[float, float, float, float]]:
+    """(east, north, height, crown radius) of every treetop the survey saw, over every grid of the area.
+    `built(east, north)` masks out roofs."""
+    out = []
+    for chunk in getattr(lidar, "chunks", [lidar]):
+        out += _treetops(chunk, built)
+    return out
+
+
+def _treetops(lidar, built) -> list[tuple[float, float, float, float]]:
     h = np.where(lidar.leafy >= LEAFY, lidar.height, 0.0)
     peaks = (h >= MIN_HEIGHT) & (h >= window_max(h, 2))
     rows, cols = np.nonzero(peaks)
@@ -68,6 +76,9 @@ def crown_radius(h: np.ndarray, row: int, col: int, cell: float) -> float:
 
 def mapped_height(lidar, east: float, north: float) -> float | None:
     """The canopy height over a mapped tree, or None where the survey saw no leaves (planted since)."""
+    lidar = next((c for c in getattr(lidar, "chunks", [lidar]) if not hasattr(c, "holds") or c.holds(east, north)), None)
+    if lidar is None:
+        return None
     r = int(MAPPED_REACH / lidar.cell)
     row, col = lidar.index(east, north)
     win = (slice(max(row - r, 0), row + r + 1), slice(max(col - r, 0), col + r + 1))
