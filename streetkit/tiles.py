@@ -196,6 +196,26 @@ def _inside(east: float, north: float, area: Area, keys: set) -> tuple[int, int]
     return key if key in keys else None
 
 
+_buildings_shared: dict = {}
+
+
+def _buildings_of(key) -> tuple:
+    """One tile's buildings, planned and drawn: (key, mesh, counts)."""
+    import collections
+
+    s = _buildings_shared
+    context, mesh, counts = s["context"], Mesh(), collections.Counter()
+    for f, ring, holes, tags in s["groups"][key]:
+        plan = plan_building(ring, holes, tags, f.osm_id, s["lidar"], s["dem"].height, s["origin"], s["datum"])
+        look = colours(tags, f.osm_id, context.kind(f, tags, ring), context.roof(f), context.shopfront(f, tags, ring), plan)
+        draw(mesh, plan, look, context.party(f), context.street_side)
+        counts[f"height from {plan.source}"] += 1
+        counts[f"roof {plan.style}"] += 1
+        counts["towers"] += len(plan.towers)
+        counts["stepped"] += bool(plan.steps)
+    return key, mesh, counts
+
+
 def build_tiles(area: Area, osm: OsmData, dem: Dem, lidar=None, roof_colours=None, stats=None, overrides=None) -> tuple[dict, float]:
     """Assigns each feature to the tile holding its centre. Geometry may cross a tile edge, which hides seams."""
     stats = {} if stats is None else stats
@@ -206,15 +226,26 @@ def build_tiles(area: Area, osm: OsmData, dem: Dem, lidar=None, roof_colours=Non
     ox, on = west, south   # meshes stay in small numbers while they are built
 
     context = BuildingContext(osm, (ox, on), lidar, roof_colours, overrides)
-    for f, ring, holes, tags in context.drawable():
-        ce, cn = ring.mean(axis=0)
+    groups: dict = {}
+    for item in context.drawable():
+        ce, cn = item[1].mean(axis=0)
         key = _inside(ce, cn, area, keys)
-        if key is None:
-            continue
-        plan = plan_building(ring, holes, tags, f.osm_id, lidar, dem.height, np.array([ox, on]), datum)
-        look = colours(tags, f.osm_id, context.kind(f, tags, ring), context.roof(f), context.shopfront(f, tags, ring), plan)
-        draw(tiles[key].meshes["buildings"], plan, look, context.party(f), context.street_side)
-        context.count(plan)
+        if key is not None:
+            groups.setdefault(key, []).append(item)
+    _buildings_shared.update(groups=groups, context=context, lidar=lidar, dem=dem, origin=np.array([ox, on]), datum=datum)
+    # Measuring a roof against the lidar is the slow part of a build, so tiles' buildings are planned in forked
+    # workers that share everything parsed so far. A tile's buildings go in the same order either way.
+    order = sorted(groups)
+    workers = min(os.cpu_count() or 1, 16) if len(order) > 32 and hasattr(os, "fork") else 1
+    if workers > 1:
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            done = list(pool.imap_unordered(_buildings_of, order, chunksize=2))
+    else:
+        done = [_buildings_of(k) for k in order]
+    for key, mesh, counts in done:
+        tiles[key].meshes["buildings"] = mesh
+        for name, n in counts.items():
+            context.stats[name] += n
     for f in context.footprints():
         ce, cn = f.rings[0].mean(axis=0)
         key = _inside(ce, cn, area, keys)

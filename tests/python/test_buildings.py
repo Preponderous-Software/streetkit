@@ -5,7 +5,7 @@ import pytest
 
 from streetkit import buildings as B
 from streetkit.context import BuildingContext
-from streetkit.lidar import Lidar, edge_distance, fill_holes
+from streetkit.lidar import Chunk, Lidar, edge_distance, fill_gaps, fill_holes
 from streetkit.mesh import Mesh, clean_ring
 from streetkit.osm import Feature, OsmData
 from streetkit.roofs import as_paint, sample
@@ -13,10 +13,14 @@ from streetkit.trees import mapped_height, treetops
 
 
 def fake_lidar(height, leafy=None, west=0.0, north=100.0, cell=1.0):
+    chunk = Chunk.__new__(Chunk)
+    chunk.height = np.asarray(height, np.float32)
+    chunk.leafy = np.zeros_like(chunk.height) if leafy is None else np.asarray(leafy, np.float32)
+    chunk.cell, chunk.w, chunk.n = cell, west, north
+    chunk.e, chunk.s = west + chunk.height.shape[1] * cell, north - chunk.height.shape[0] * cell
     lid = Lidar.__new__(Lidar)
-    lid.height = np.asarray(height, np.float32)
-    lid.leafy = np.zeros_like(lid.height) if leafy is None else np.asarray(leafy, np.float32)
-    lid.cell, lid.w, lid.n = cell, west, north
+    lid.chunks, lid.cell = [chunk], cell
+    lid.height, lid.leafy, lid.w, lid.n = chunk.height, chunk.leafy, west, north
     return lid
 
 
@@ -241,3 +245,47 @@ def test_a_roof_colour_is_the_median_of_its_lit_pixels():
     rgb = sample(image, (0, 0, 100, 100), box(30, 30, 70, 70))
     assert rgb == (180, 60, 50)
     assert as_paint((128, 128, 128)) == (118, 118, 118)
+
+
+# ------------------------------------------------------------------ cities: the grid in pieces
+
+def test_fill_gaps_reaches_across_a_wide_gap_and_keeps_what_is_known():
+    v = np.zeros((40, 40))
+    known = np.zeros((40, 40), bool)
+    known[:, :5], known[:, 35:] = True, True
+    v[:, :5], v[:, 35:] = 10.0, 20.0
+    out = fill_gaps(v, known)
+    assert (out[:, :5] == 10).all() and (out[:, 35:] == 20).all()
+    assert np.isfinite(out).all() and 10 <= out[:, 5:35].min() and out[:, 5:35].max() <= 20
+
+
+def test_a_mosaic_samples_each_piece_and_reads_a_roof_across_the_seam(tmp_path):
+    from streetkit.lidar import write
+    write(tmp_path / "a.tif", (0, 0, 50, 50), np.full((50, 50), 6.0), np.zeros((50, 50)))
+    write(tmp_path / "b.tif", (50, 0, 100, 50), np.full((50, 50), 9.0), np.zeros((50, 50)))
+    lid = Lidar(tmp_path / "a.tif", tmp_path / "b.tif")
+    h, leafy = lid.sample(np.array([10.0, 60.0, 500.0]), np.array([10.0, 10.0, 10.0]))
+    assert h.tolist() == [6.0, 9.0, 0.0]          # nothing out of every piece
+    e, n, hh, _ = lid.cells_in(box(45, 10, 55, 20))
+    assert set(hh.tolist()) == {6.0, 9.0} and len(hh) == 100
+
+
+def test_city_chunks_hold_their_tiles(monkeypatch):
+    from streetkit.geo import Area
+    from streetkit.lidar import city_chunks
+    area = Area("c", 0, 0, 500.0, 0, 2.0, keys=((9, 9), (10, 9), (19, 0)))
+    chunks = city_chunks(area)
+    assert set(chunks) == {(0, 0), (1, 0)}   # tile (9, 9) is in square (0, 0); (10, 9) and (19, 0) in square (1, 0)
+    assert chunks[(0, 0)] == [(4500.0, 4500.0, 5000.0, 5000.0)] and len(chunks[(1, 0)]) == 2
+
+
+def test_surveys_are_newest_first_and_only_where_they_cover():
+    from streetkit.lidar import surveys_over
+    from streetkit.geo import utm_to_lonlat
+    lon, lat = utm_to_lonlat(493000.0, 4492000.0)
+    square = [[lon - 0.1, lat - 0.1], [lon + 0.1, lat - 0.1], [lon + 0.1, lat + 0.1], [lon - 0.1, lat + 0.1]]
+    far = [[lon + 5, lat + 5], [lon + 6, lat + 5], [lon + 6, lat + 6]]
+    index = [{"geometry": {"type": "Polygon", "coordinates": [square]}, "properties": {"name": "OLD_2013_LAS_2015"}},
+             {"geometry": {"type": "Polygon", "coordinates": [square]}, "properties": {"name": "NEW_2021"}},
+             {"geometry": {"type": "Polygon", "coordinates": [far]}, "properties": {"name": "ELSEWHERE_2023"}}]
+    assert surveys_over([(492900.0, 4491900.0, 493100.0, 4492100.0)], index) == ["NEW_2021", "OLD_2013_LAS_2015"]

@@ -79,8 +79,7 @@ def sample(image: np.ndarray, bounds, ring: np.ndarray, lidar=None) -> tuple | N
     if inside.sum() >= 12:
         inside &= edge_distance(ge, gn, ring) > 0.7
     if lidar is not None and inside.any():
-        r, c = lidar.index(ge, gn)
-        inside &= lidar.leafy[r, c] < 0.35
+        inside &= lidar.sample(ge, gn)[1] < 0.35
     rgb = image[rows.ravel(), cols.ravel()][inside].astype(np.float64)
     if len(rgb) < 6:
         return None

@@ -19,7 +19,7 @@ from .geo import Area, utm_to_lonlat
 from .osm import parse
 from .sanitize import sanitize
 from .streets import load_names, load_places, manifest_lines, place_lines
-from .lidar import FILE as LIDAR_FILE, Lidar, fetch_lidar
+from .lidar import FILE as LIDAR_FILE, Lidar, fetch_lidar, fetch_lidar_city
 from .roofs import FILE as ROOFS_FILE, NAIP, fetch_image, load as load_roofs, sample_roofs
 from .tiles import Dem, build_all
 
@@ -38,6 +38,7 @@ def main(argv=None) -> int:
     ap.add_argument("--sources", type=Path, default=ROOT / "city" / "SOURCES.json", help="a city's pinned downloads")
     ap.add_argument("--sample", type=int, default=1, help="write every Nth tile, to measure a large area")
     ap.add_argument("--resume", action="store_true", help="keep tiles already written, after an interrupted build")
+    ap.add_argument("--workers", type=int, default=4, help="processes for a city's lidar, each about 2 GB of memory")
     args = ap.parse_args(argv)
     area = Area.load(args.area)
     city = area.boundary_relation != 0
@@ -57,6 +58,16 @@ def main(argv=None) -> int:
         (args.raw / "SOURCES.json").write_text(json.dumps(sources, indent=1) + "\n")
         return 0
     if args.command == "lidar":
+        if city:
+            # Too large to commit, like the rest of a city's raw data: pinned by hash in the city's sources.
+            city_area = area.within(boundary_rings(args.raw / "boundary.osm"))
+            files = fetch_lidar_city(city_area, args.raw, args.fetched / "lidar", workers=args.workers)
+            pinned = json.loads(args.sources.read_text()) if args.sources.exists() else {}
+            for path, source in files:
+                pinned[path.name] = {"url": source, "sha256": sha256(path), "bytes": path.stat().st_size}
+            args.sources.write_text(json.dumps(pinned, indent=1) + "\n")
+            print(f"wrote {len(files)} lidar squares to {args.raw}")
+            return 0
         path, source = fetch_lidar(area, args.raw, args.fetched / "lidar", json.loads(args.area.read_text()).get("lidar_survey"))
         _record(args.raw, path, source)
         print(f"wrote {path}")
@@ -92,8 +103,9 @@ def main(argv=None) -> int:
     names = args.raw / "street-names.csv"
     streets = manifest_lines(area, osm, load_names(names)) if names.exists() else []
     streets += place_lines(area, load_places(args.places)) if args.places.exists() else []
-    lidar_path = args.raw / LIDAR_FILE
-    lidar = Lidar(lidar_path) if lidar_path.exists() else None
+    grids = sorted(args.raw.glob("lidar-*-*.tif")) if city else [args.raw / LIDAR_FILE]
+    grids = [g for g in grids if g.exists()]
+    lidar = Lidar(*grids) if grids else None
     summary = build_all(area, osm, dem, args.out, streets, lidar=lidar, roof_colours=load_roofs(args.raw / ROOFS_FILE),
                         overrides=load_overrides(args.places.parent / "building-overrides.csv"),
                         sample=args.sample, resume=args.resume, quiet=not city)
