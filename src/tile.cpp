@@ -60,6 +60,56 @@ float Tile::heightAt(float x, float z) const {
     return north + (south - north) * v;
 }
 
+float Overview::heightAt(double e, double n) const {
+    const float fx = std::clamp(static_cast<float>((e - east) / cell), 0.0f, static_cast<float>(cols - 1));
+    const float fz = std::clamp(static_cast<float>((north - n) / cell), 0.0f, static_cast<float>(rows - 1));
+    const int c = std::min(static_cast<int>(fx), cols - 2), r = std::min(static_cast<int>(fz), rows - 2);
+    const float u = fx - static_cast<float>(c), v = fz - static_cast<float>(r);
+    const float* a = &heights[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)];
+    const float* b = a + cols;
+    const float top = a[0] + (a[1] - a[0]) * u, bottom = b[0] + (b[1] - b[0]) * u;
+    return top + (bottom - top) * v;
+}
+
+bool loadOverview(const std::string& path, Overview& o, std::string* error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        if (error) *error = path + ": cannot open";
+        return false;
+    }
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (parseOverview(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), o, error)) return true;
+    if (error) *error = path + ": " + *error;
+    return false;
+}
+
+// overview.bin, as streetkit/tiles.py writes it: "PDROVER1", version, cols, rows, cell, east, north, heights, colours.
+bool parseOverview(const uint8_t* data, size_t size, Overview& o, std::string* error) {
+    auto fail = [&](const char* what) {
+        if (error) *error = what;
+        return false;
+    };
+    Reader r{data, size};
+    char magic[8];
+    if (!r.bytes(magic, 8) || std::memcmp(magic, "PDROVER1", 8) != 0) return fail("not an overview");
+    o = Overview{};
+    if (r.get<uint32_t>() != 1) return fail("unsupported version");
+    o.cols = r.get<int32_t>();
+    o.rows = r.get<int32_t>();
+    o.cell = r.get<float>();
+    o.east = r.get<double>();
+    o.north = r.get<double>();
+    if (!r.ok || o.cols < 2 || o.rows < 2 || o.cols > 1025 || o.rows > 1025 || !(o.cell > 0)) return fail("bad header");
+    const size_t n = static_cast<size_t>(o.cols) * static_cast<size_t>(o.rows);
+    r.array(o.heights, n);
+    r.array(o.colors, n * 3);
+    if (!r.ok) {
+        o = Overview{};
+        return fail("truncated");
+    }
+    return true;
+}
+
 bool Manifest::has(TileKey k) const { return std::find(tiles.begin(), tiles.end(), k) != tiles.end(); }
 
 std::string Manifest::path(TileKey k) const {
@@ -88,7 +138,8 @@ bool parseManifest(const std::string& text, const std::string& dir, Manifest& m)
     while (std::getline(in, line)) {
         std::istringstream s(line);
         s >> word;
-        if (word == "streetkit-manifest" || word == "old-town-walk-manifest") {  // the second: tiles built before streetkit
+        // The older names are of the games streetkit came from, so tiles built before it still load.
+        if (word == "streetkit-manifest" || word == "old-town-walk-manifest" || word == "ponderosa-manifest") {
             int version = 0;
             s >> version;
             header = version == 1;
@@ -97,6 +148,7 @@ bool parseManifest(const std::string& text, const std::string& dir, Manifest& m)
         else if (word == "cell") s >> m.cell;
         else if (word == "datum") s >> m.datum;
         else if (word == "latitude") s >> m.latitude;
+        else if (word == "overview") s >> m.overview;
         else if (word == "start") s >> m.startEast >> m.startNorth;
         else if (word == "tile") {
             TileKey k;
@@ -153,7 +205,9 @@ bool parseTile(const uint8_t* data, size_t size, Tile& t, std::string* error) {
     };
     Reader r{data, size};
     char magic[8];
-    if (!r.bytes(magic, 8) || std::memcmp(magic, "OTWTILE1", 8) != 0) return fail("not a tile");
+    // PDRTILE1 is the same layout under Ponderosa's name, so tiles it built before streetkit still load.
+    if (!r.bytes(magic, 8) || (std::memcmp(magic, "OTWTILE1", 8) != 0 && std::memcmp(magic, "PDRTILE1", 8) != 0))
+        return fail("not a tile");
     t = Tile{};
     if (r.get<uint32_t>() != 1) return fail("unsupported version");
     t.key.ix = r.get<int32_t>();

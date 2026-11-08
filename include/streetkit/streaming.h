@@ -30,6 +30,18 @@ inline double tileDistance(TileKey k, double east, double north, double size) {
     return std::hypot(dx, dy);
 }
 
+// When the next tile may load. A load costs a frame, so they are spaced out unless the viewer has nothing to stand on.
+inline bool loadDue(float secondsSinceLoad, bool tileUnderViewerMissing) {
+    return tileUnderViewerMissing || secondsSinceLoad >= 0.12f;
+}
+
+// Near and far planes for an eye this far above the ground, for a map with an overview. The near plane lifts with
+// height, which keeps depth precise enough at distance to tell the tiles from the overview just under them.
+inline void clipPlanes(float aboveGround, float& nearPlane, float& farPlane) {
+    nearPlane = std::clamp(aboveGround * 0.05f, 0.1f, 20.0f);
+    farPlane = 40000.0f;
+}
+
 inline StreamPlan planStreaming(const std::vector<TileKey>& available, const std::set<TileKey>& loaded, double east,
                                 double north, double size, const StreamConfig& c) {
     StreamPlan plan;

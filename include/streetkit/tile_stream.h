@@ -84,7 +84,29 @@ public:
         trees_.clear();
         meshCount_ = 0;
         poolTexture_ = windowTexture_ = 0;
+        if (overview_) showOverview(*overview_);   // nothing survives a lost context, the terrain included
     }
+
+    // Draws an area's overview under the tiles as Strata's terrain, and lets ground and flight reach over it.
+    // The overview must outlive the stream. Returns false when Strata refuses it.
+    bool showOverview(const Overview& o) {
+        overview_ = &o;
+        if (o.empty()) return true;
+        // Strata lays samples along +x then +z, which is how the file runs: from the north-west, rows to the south.
+        std::vector<float> colors(o.colors.size());
+        for (size_t i = 0; i < colors.size(); ++i) colors[i] = linear_[o.colors[i]];
+        StrataTerrainTile tile{};
+        tile.origin[0] = static_cast<float>(o.east - origin_.ix * static_cast<double>(m_.tileSize));
+        tile.origin[2] = static_cast<float>((origin_.iy + 1) * static_cast<double>(m_.tileSize) - o.north);
+        tile.cell_size = o.cell;
+        tile.samples_x = o.cols;
+        tile.samples_z = o.rows;
+        tile.heights = o.heights.data();
+        tile.colors = colors.data();
+        return check(strata_set_terrain(engine_, &tile), "overview");
+    }
+    // Flight goes wherever there is land to see, which with an overview is further than the tiles in memory.
+    bool flyable(float x, float z) const { return walkable(x, z) || (overview_ && overview_->covers(east(x), north(z))); }
     void setLoadRadius(float radius) {
         config_.loadRadius = radius;
         config_.unloadRadius = radius + 200;
@@ -94,7 +116,7 @@ public:
     float groundAt(float x, float z) const {
         const TileKey k = keyAt(x, z);
         const auto t = tiles_.find(k);
-        if (t == tiles_.end()) return 0;
+        if (t == tiles_.end()) return overview_ && !overview_->empty() ? overview_->heightAt(east(x), north(z)) : 0;
         return t->second.tile.heightAt(x - offsetX(k), z - offsetZ(k));
     }
     const Solids& solids() const { return solids_; }
@@ -336,6 +358,7 @@ private:
     std::vector<StrataRenderItem> trees_, near_;
     std::vector<Lamp> lamps_;
     uint32_t poolTexture_ = 0, windowTexture_ = 0;
+    const Overview* overview_ = nullptr;
     int nightStep_ = 0;
     int waiting_ = 0, meshCount_ = 0, peakMeshes_ = 0, loads_ = 0, unloads_ = 0;
     double readMs_ = 0, uploadMs_ = 0, worstLoadMs_ = 0;

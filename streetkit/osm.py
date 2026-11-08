@@ -68,6 +68,11 @@ def parse(paths: list[Path]) -> OsmData:
                 ways[el.get("id")] = ([n.get("ref") for n in el.findall("nd")], tags)
             elif el.tag == "relation":
                 relations[el.get("id")] = ([(m.get("type"), m.get("ref"), m.get("role")) for m in el.findall("member")], tags)
+    return assemble(nodes, node_tags, ways, relations)
+
+
+def assemble(nodes: dict, node_tags: dict, ways: dict, relations: dict) -> OsmData:
+    """nodes: id -> (lon, lat); ways: id -> (node ids, tags); relations: id -> ((type, ref, role), tags)."""
 
     ids = list(nodes)
     east, north = lonlat_to_utm(np.array([nodes[i][0] for i in ids]), np.array([nodes[i][1] for i in ids]))

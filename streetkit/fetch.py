@@ -1,17 +1,26 @@
-"""Downloads the raw data once. OSM downloads carry contributor metadata, so they stay out of git: `streetkit
-sanitize` reduces them to data/raw/osm-sample.osm, and the build reads only that, offline."""
+"""Downloads the raw data once. A small area's raw files are committed; a city's are too large, so only their URLs
+and SHA-256 are (fetch_city, verify_city). The build is offline either way.
+
+OSM downloads carry contributor metadata, so they stay out of git: `streetkit sanitize` reduces them to data/raw/osm-sample.osm, and the build reads only that, offline."""
 
 from __future__ import annotations
 
 import csv
 import hashlib
 import json
+import math
+import shutil
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from .geo import UTM_EPSG, Area, utm_to_lonlat
+import numpy as np
+
+from .geo import UTM_EPSG, Area, lonlat_to_utm, utm_to_lonlat
+from .osm import _join
 from .streets import ROADS
 
 OSM_MAP = "https://api.openstreetmap.org/api/0.6/map"
@@ -19,6 +28,9 @@ OVERPASS = ("https://overpass.private.coffee/api/interpreter", "https://overpass
             "https://overpass.kumi.systems/api/interpreter")
 DEM_EXPORT = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
 USER_AGENT = "streetkit/0.1 (open data 3D map)"
+OSM_RELATION = "https://api.openstreetmap.org/api/0.6/relation"
+DEM_CHUNK_M = 5000.0   # a city's elevation is fetched in squares this wide
+DEM_BORDER_M = 8.0     # beyond a tile's edge, for the normals and for geometry that crosses it
 BLOCK_M = 1000.0   # OSM is fetched in blocks this wide, which keeps each call under the API's node limit
 MARGIN_M = 60.0    # roads and buildings that start just outside the area
 
@@ -29,8 +41,28 @@ def _get(url: str) -> bytes:
         return r.read()
 
 
+def _download(url: str, path: Path) -> None:
+    """To a file, in pieces, and only under its name once it is whole."""
+    part = path.with_suffix(path.suffix + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=240) as r, open(part, "wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+            part.replace(path)
+            return
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == 5:
+                raise
+            time.sleep(2 ** attempt * 5)   # public services fail for a while under load
+
+
 def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def fetch(area: Area, raw: Path) -> None:
@@ -93,6 +125,67 @@ def fetch_street_names(area: Area, raw: Path) -> Path:
     sources[path.name] = {"url": host, "sha256": sha256(path), "bytes": path.stat().st_size}
     (raw / "SOURCES.json").write_text(json.dumps(sources, indent=1) + "\n")
     return path
+
+
+def boundary_rings(path: Path) -> list:
+    """The outer rings of a boundary relation, from the XML of `relation/<id>/full`, in UTM."""
+    root = ET.parse(path).getroot()
+    nodes = {n.get("id"): (float(n.get("lon")), float(n.get("lat"))) for n in root.findall("node")}
+    ways = {w.get("id"): [nd.get("ref") for nd in w.findall("nd")] for w in root.findall("way")}
+    outers = [ways[m.get("ref")] for m in root.find("relation").findall("member")
+              if m.get("type") == "way" and m.get("role") == "outer" and m.get("ref") in ways]
+    rings = []
+    for refs in _join(outers):
+        lon, lat = np.array([nodes[r] for r in refs]).T
+        rings.append(np.column_stack(lonlat_to_utm(lon, lat))[:-1])
+    return rings
+
+
+def dem_chunks(area: Area, keys: list) -> list[tuple[int, int]]:
+    """The DEM_CHUNK_M squares that hold any tile, each with the border its tiles' normals read."""
+    size = area.tile_size
+    out = set()
+    for ix, iy in keys:
+        for e in (ix * size - DEM_BORDER_M, (ix + 1) * size + DEM_BORDER_M):
+            for n in (iy * size - DEM_BORDER_M, (iy + 1) * size + DEM_BORDER_M):
+                out.add((math.floor(e / DEM_CHUNK_M), math.floor(n / DEM_CHUNK_M)))
+    return sorted(out)
+
+
+def fetch_city(area: Area, raw: Path, sources: Path) -> None:
+    """The boundary, the regional extract and the DEM chunks. Writes their URLs and SHA-256 to `sources`."""
+    raw.mkdir(parents=True, exist_ok=True)
+    pinned = json.loads(sources.read_text()) if sources.exists() else {}
+    record = {}
+
+    def save(name: str, url: str) -> Path:
+        path = raw / name
+        if not path.exists():
+            _download(url, path)
+            time.sleep(1.1)
+        digest = sha256(path)
+        if name in pinned and pinned[name]["sha256"] != digest:
+            raise SystemExit(f"{name} does not match {sources}")
+        record[name] = {"url": url, "sha256": digest, "bytes": path.stat().st_size}
+        return path
+
+    boundary = save("boundary.osm", f"{OSM_RELATION}/{area.boundary_relation}/full")
+    save("region.osm.pbf", area.osm_extract)
+    city = area.within(boundary_rings(boundary))
+    px = int(DEM_CHUNK_M / area.cell)
+    for ce, cn in dem_chunks(area, city.tiles()):
+        e, n = int(ce * DEM_CHUNK_M), int(cn * DEM_CHUNK_M)
+        query = {"bbox": f"{e},{n},{e + DEM_CHUNK_M:.0f},{n + DEM_CHUNK_M:.0f}", "bboxSR": UTM_EPSG, "imageSR": UTM_EPSG,
+                 "size": f"{px},{px}", "format": "tiff", "pixelType": "F32",
+                 "interpolation": "RSP_BilinearInterpolation", "noDataInterpretation": "esriNoDataMatchAny", "f": "image"}
+        save(f"dem-{ce}-{cn}.tif", DEM_EXPORT + "?" + urllib.parse.urlencode(query))
+    sources.parent.mkdir(parents=True, exist_ok=True)
+    sources.write_text(json.dumps(record, indent=1) + "\n")
+
+
+def verify_city(raw: Path, sources: Path) -> list[str]:
+    pinned = json.loads(sources.read_text())
+    return [name for name, s in pinned.items() if not (raw / name).exists() or sha256(raw / name) != s["sha256"]]
 
 
 def verify(raw: Path) -> list[str]:

@@ -518,6 +518,9 @@ static void testFiles() {
     CHECK(fromMemory.key == k && fromMemory.samples == t.samples && fromMemory.trees.size() == t.trees.size());
     CHECK(!streetkit::parseTile(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size() / 2, fromMemory, &err));
     CHECK(!streetkit::parseTile(reinterpret_cast<const uint8_t*>("not a tile at all"), 17, fromMemory, &err));
+    std::string ponderosaTile = bytes;   // the same bytes under Ponderosa's name for the format
+    ponderosaTile.replace(0, 8, "PDRTILE1");
+    CHECK(streetkit::parseTile(reinterpret_cast<const uint8_t*>(ponderosaTile.data()), ponderosaTile.size(), fromMemory, &err));
     streetkit::Manifest none;
     CHECK(!streetkit::parseManifest("nothing here", "tiles", none));
     CHECK(streetkit::parseManifest("old-town-walk-manifest 1\ntile_size 500\ntile 1 2\n", "tiles", none));
@@ -532,6 +535,41 @@ static void testFiles() {
         for (int r = 0; r < t.samples; ++r) worst = std::max(worst, std::fabs(t.height(t.samples - 1, r) - east.height(0, r)));
         CHECK(worst == 0);
     }
+}
+
+static void testPacing() {
+    CHECK(streetkit::loadDue(0.2f, false) && !streetkit::loadDue(0.01f, false) && streetkit::loadDue(0.01f, true));
+    float nearPlane, farPlane;
+    streetkit::clipPlanes(1.65f, nearPlane, farPlane);
+    CHECK(nearPlane == 0.1f);
+    streetkit::clipPlanes(400, nearPlane, farPlane);
+    CHECK(nearPlane == 20.0f && farPlane > 30000);
+}
+
+static void testOverview() {
+    // An overview in memory, as tiles.py writes it: 3 x 2 samples 10 m apart from (1000, 2000), heights 0..5.
+    std::string bytes("PDROVER1", 8);
+    auto put = [&](const void* v, size_t n) { bytes.append(static_cast<const char*>(v), n); };
+    const uint32_t version = 1;
+    const int32_t cols = 3, rows = 2;
+    const float cell = 10;
+    const double east = 1000, north = 2000;
+    put(&version, 4); put(&cols, 4); put(&rows, 4); put(&cell, 4); put(&east, 8); put(&north, 8);
+    for (int i = 0; i < 6; ++i) { const float h = static_cast<float>(i); put(&h, 4); }
+    for (int i = 0; i < 18; ++i) bytes.push_back(static_cast<char>(i));
+    bytes.append(2, '\0');
+    streetkit::Overview o;
+    std::string err;
+    CHECK(streetkit::parseOverview(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), o, &err));
+    CHECK(o.cols == 3 && o.rows == 2 && o.colors.size() == 18 && o.colors[17] == 17);
+    CHECK(o.covers(1000, 2000) && o.covers(1020, 1990) && !o.covers(1021, 1995) && !o.covers(1005, 1989));
+    CHECK(std::fabs(o.heightAt(1010, 2000) - 1.0f) < 1e-5f);       // second sample of the first row
+    CHECK(std::fabs(o.heightAt(1005, 1995) - 2.0f) < 1e-5f);       // the middle of the first square: (0+1+3+4)/4
+    CHECK(!streetkit::parseOverview(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size() - 10, o, &err) && o.empty());
+    CHECK(!streetkit::parseOverview(reinterpret_cast<const uint8_t*>("PDROVER2xxxxxxxx"), 16, o, &err));
+    streetkit::Manifest m;
+    CHECK(streetkit::parseManifest("ponderosa-manifest 1\ntile_size 500\noverview overview.bin\ntile 1 2 3 abc\n", "d", m));
+    CHECK(m.overview == "overview.bin");
 }
 
 static void testFindTiles() {
@@ -554,6 +592,8 @@ static void testFindTiles() {
 int main(int argc, char** argv) {
     if (argc > 1) tilesDir = argv[1];
     testFindTiles();
+    testOverview();
+    testPacing();
     testStreaming();
     testWalking();
     testFiles();
