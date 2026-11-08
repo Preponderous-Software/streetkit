@@ -17,7 +17,11 @@ Indices are u16 when the mesh has fewer than 65536 vertices.
 from __future__ import annotations
 
 import hashlib
+import math
+import multiprocessing
+import os
 import struct
+import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,18 +59,31 @@ PATH_WIDTHS = {"footway": 1.8, "path": 1.5, "cycleway": 2.5, "pedestrian": 4, "s
 
 
 class Dem:
-    """A north-up float32 GeoTIFF in the grid's UTM zone, sampled bilinearly at pixel centres."""
+    """North-up float32 GeoTIFFs in the grid's UTM zone, sampled bilinearly at pixel centres.
 
-    def __init__(self, path: Path):
+    Several files of the same pixel size become one mosaic. They may overlap, and may leave gaps at the corners
+    of an area that is not a rectangle; a gap reads as the median height.
+    """
+
+    def __init__(self, *paths: Path):
         import tifffile
-        with tifffile.TiffFile(path) as tif:
-            page = tif.pages[0]
-            self.z = page.asarray().astype(np.float64)
-            scale, tie = page.tags["ModelPixelScaleTag"].value, page.tags["ModelTiepointTag"].value
-        bad = self.z < -1000
+        parts = []
+        for path in paths:
+            with tifffile.TiffFile(path) as tif:
+                page = tif.pages[0]
+                parts.append((page.asarray().astype(np.float32), page.tags["ModelPixelScaleTag"].value,
+                              page.tags["ModelTiepointTag"].value))
+        self.sx, self.sy = float(parts[0][1][0]), float(parts[0][1][1])
+        self.e0, self.n0 = min(float(p[2][3]) for p in parts), max(float(p[2][4]) for p in parts)
+        cols = max(round((float(p[2][3]) - self.e0) / self.sx) + p[0].shape[1] for p in parts)
+        rows = max(round((self.n0 - float(p[2][4])) / self.sy) + p[0].shape[0] for p in parts)
+        self.z = np.full((rows, cols), np.nan, dtype=np.float32)
+        for z, _, tie in parts:
+            c, r = round((float(tie[3]) - self.e0) / self.sx), round((self.n0 - float(tie[4])) / self.sy)
+            self.z[r:r + z.shape[0], c:c + z.shape[1]] = z
+        bad = ~(self.z > -1000)
         if bad.any():
             self.z[bad] = np.median(self.z[~bad])
-        self.sx, self.sy, self.e0, self.n0 = float(scale[0]), float(scale[1]), float(tie[3]), float(tie[4])
 
     def height(self, east, north):
         col = np.clip((np.asarray(east, np.float64) - self.e0) / self.sx - 0.5, 0, self.z.shape[1] - 1.000001)
@@ -76,6 +93,92 @@ class Dem:
         top = self.z[r, c] * (1 - fc) + self.z[r, c + 1] * fc
         bottom = self.z[r + 1, c] * (1 - fc) + self.z[r + 1, c + 1] * fc
         return top * (1 - fr) + bottom * fr
+
+
+@dataclass
+class Overview:
+    """The whole area at low resolution, always below the detailed tiles so they cover it where they are loaded."""
+    east: float                  # UTM of the sample in the north-west corner
+    north: float
+    cell: float
+    heights: np.ndarray          # rows from the north
+    colours: np.ndarray          # sRGB bytes
+
+
+OVERVIEW_DROP = 1.0              # metres below the lowest detailed ground in reach of a sample
+OVERVIEW_MAX_SAMPLES = 1025      # what one Strata terrain tile holds per side
+OVERVIEW_MAGIC = b"PDROVER1"     # the format's name from Ponderosa, where it began
+OVERVIEW_ROOF = (120, 112, 104)  # roofs smaller than a sample tint it this colour
+OVERVIEW_HEADER = struct.Struct("<8sIiifdd")
+
+
+def overview_cell(area: Area) -> float:
+    """The requested spacing, or the smallest whole number of metres that fits one terrain tile."""
+    west, south, east, north = area.bounds()
+    return max(area.overview_cell, float(math.ceil(max(east - west, north - south) / (OVERVIEW_MAX_SAMPLES - 1))))
+
+
+def build_overview(area: Area, osm: OsmData, painted: list, dem: Dem, datum: float) -> Overview:
+    west, south, east, north = area.bounds()
+    cell = overview_cell(area)
+    cols, rows = int(math.ceil((east - west) / cell)) + 1, int(math.ceil((north - south) / cell)) + 1
+    ex, ny = west + np.arange(cols) * cell, north - np.arange(rows) * cell
+
+    # A cell's lowest ground, sampled at the DEM's own spacing. Each corner takes the lowest of the cells around
+    # it, so the interpolated surface stays below the detailed ground everywhere.
+    per_cell = max(2, int(round(cell / dem.sx)))
+    fine = (np.arange(per_cell) + 0.5) / per_cell * cell
+    lowest = np.empty((rows - 1, cols - 1), dtype=np.float32)
+    for r in range(rows - 1):
+        gx, gy = np.meshgrid(ex[:-1, None] + fine, ny[r] - fine, sparse=False, indexing="xy")
+        lowest[r] = dem.height(gx.reshape(-1), gy.reshape(-1)).reshape(gx.shape).min(axis=0).reshape(-1, per_cell).min(axis=1)
+    pad = np.pad(lowest, 1, mode="edge")
+    heights = np.minimum.reduce([pad[:-1, :-1], pad[:-1, 1:], pad[1:, :-1], pad[1:, 1:]]) - datum - OVERVIEW_DROP
+
+    colours = np.empty((rows, cols, 3), dtype=np.float32)
+    colours[:] = GRASS
+    gx, gy = np.meshgrid(ex, ny)
+    for box, ring, rgb in painted:
+        c0, c1 = max(0, int((box[0] - west) // cell)), min(cols - 1, int((box[2] - west) // cell) + 1)
+        r0, r1 = max(0, int((north - box[3]) // cell)), min(rows - 1, int((north - box[1]) // cell) + 1)
+        if c0 > c1 or r0 > r1:
+            continue
+        window = (slice(r0, r1 + 1), slice(c0, c1 + 1))
+        colours[window][points_in_ring(gx[window], gy[window], ring)] = rgb
+
+    # Roofs and roads are smaller than a sample, so they tint it by how much of it they cover.
+    roofs, roads = np.zeros((rows, cols), np.float32), np.zeros((rows, cols), np.float32)
+    def cover(grid, e, n, amount):
+        c, r = int(round((e - west) / cell)), int(round((north - n) / cell))
+        if 0 <= c < cols and 0 <= r < rows:
+            grid[r, c] += amount
+    for f in osm.areas:
+        if "building" in f.tags:
+            ring = f.rings[0]
+            cover(roofs, *ring.mean(axis=0), abs(signed_area(ring)))
+    for f in osm.lines:
+        hw = f.tags.get("highway")
+        width = ROAD_WIDTHS.get(hw)
+        if width is None or f.line is None:
+            continue
+        for a, b in zip(f.line, f.line[1:]):
+            cover(roads, *((a + b) / 2), float(np.linalg.norm(b - a)) * width)
+    for grid, rgb in ((roofs, OVERVIEW_ROOF), (roads, ASPHALT)):
+        # Smoothed over its neighbours, so a suburb reads as an even tone rather than speckle.
+        pad = np.pad(grid, 1, mode="edge")
+        smooth = sum(pad[1 + dy:rows + 1 + dy, 1 + dx:cols + 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)) / 9
+        share = np.minimum(1.0, smooth / (cell * cell))[..., None]
+        colours = colours * (1 - share) + np.array(rgb, np.float32) * share
+    return Overview(float(west), float(north), cell, heights.astype(np.float32), np.clip(colours, 0, 255).astype(np.uint8))
+
+
+def write_overview(path: Path, o: Overview) -> None:
+    rows, cols = o.heights.shape
+    pad = b"\0" * (-o.colours.size % 4)
+    with open(path, "wb") as f:
+        f.write(OVERVIEW_HEADER.pack(OVERVIEW_MAGIC, 1, cols, rows, o.cell, o.east, o.north))
+        f.write(o.heights.tobytes())
+        f.write(o.colours.tobytes() + pad)
 
 
 @dataclass
@@ -248,10 +351,12 @@ def write_tile(path: Path, area: Area, tile: Tile, painted: list, dem: Dem, datu
             f.write(TREE.pack(east - tw, y, tn - north, height, radius, *[(c / 255) ** 2.2 for c in rgb]))
 
 
-def write_manifest(path: Path, area: Area, datum: float, sizes: dict, streets: list = ()) -> None:
+def write_manifest(path: Path, area: Area, datum: float, sizes: dict, streets: list = (), overview: str = "") -> None:
     e, n = area.centre_utm()
     lines = ["streetkit-manifest 1", f"name {area.name}", "epsg 32613", f"tile_size {area.tile_size:g}", f"cell {area.cell:g}",
              f"datum {datum:g}", f"latitude {area.centre_lat}", f"start {e:.1f} {n:.1f}", f"tiles {len(sizes)}"]
+    if overview:
+        lines.insert(-1, f"overview {overview}")
     lines += [f"tile {ix} {iy} {size} {digest}" for (ix, iy), (size, digest) in sorted(sizes.items())]
     lines += streets
     path.write_text("\n".join(lines) + "\n")
@@ -264,7 +369,7 @@ def read_manifest(path: Path) -> dict:
         if word == "tile":
             ix, iy, size, digest = rest.split()
             tiles[(int(ix), int(iy))] = (int(size), digest)
-        elif word not in ("streetkit-manifest", "old-town-walk-manifest", "tiles"):
+        elif word not in ("streetkit-manifest", "old-town-walk-manifest", "ponderosa-manifest", "tiles"):
             out[word] = rest
     out["tiles"] = tiles
     return out
@@ -274,16 +379,55 @@ def tile_name(ix: int, iy: int) -> str:
     return f"{ix}_{iy}.tile"
 
 
-def build_all(area: Area, osm: OsmData, dem: Dem, out: Path, streets: list = (), lidar=None, roof_colours=None, overrides=None) -> dict:
+_shared = {}
+
+
+def _write_one(key) -> tuple:
+    """One tile, under its name only once it is whole, so a tile file that exists is a finished tile."""
+    s = _shared
+    path = s["out"] / tile_name(*key)
+    if not (s["resume"] and path.exists()):
+        part = path.with_suffix(f".part{os.getpid()}")
+        write_tile(part, s["area"], s["tiles"][key], s["painted"], s["dem"], s["datum"])
+        part.replace(path)
+    return key, path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _say(start: float, text: str) -> None:
+    print(f"[{time.time() - start:6.0f} s] {text}", flush=True)
+
+
+def build_all(area: Area, osm: OsmData, dem: Dem, out: Path, streets: list = (), lidar=None, roof_colours=None,
+              overrides=None, sample: int = 1, resume: bool = False, quiet: bool = True) -> dict:
+    """Every tile, or every `sample`th to measure a large area. `resume` keeps the tile files already written. An
+    area with an overview cell also gets overview.bin, the whole area at low resolution."""
+    start = time.time()
+    say = (lambda text: None) if quiet else (lambda text: _say(start, text))
     out.mkdir(parents=True, exist_ok=True)
     stats = {}
     tiles, datum = build_tiles(area, osm, dem, lidar, roof_colours, stats, overrides)
+    say(f"planned {sum(len(t.footprints) for t in tiles.values())} buildings in {len(tiles)} tiles")
     painted = painted_areas(osm)
-    sizes = {}
-    for key, tile in sorted(tiles.items()):
-        path = out / tile_name(*key)
-        write_tile(path, area, tile, painted, dem, datum)
-        sizes[key] = (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest()[:16])
-    write_manifest(out / "manifest.txt", area, datum, sizes, streets)
-    return {"tiles": len(tiles), "buildings": sum(len(t.footprints) for t in tiles.values()),
-            "trees": sum(len(t.trees) for t in tiles.values()), "bytes": sum(s for s, _ in sizes.values()), **stats}
+    _shared.update(out=out, area=area, tiles=tiles, painted=painted, dem=dem, datum=datum, resume=resume)
+    keys = sorted(tiles)[::sample]
+    # Forked workers share the parsed data; there is no fork on Windows, and a small area does not need it.
+    workers = min(os.cpu_count() or 1, 16) if len(keys) > 32 and hasattr(os, "fork") else 1
+    if workers > 1:
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            written = []
+            for result in pool.imap_unordered(_write_one, keys, chunksize=4):
+                written.append(result)
+                if len(written) % 50 == 0:
+                    say(f"{len(written)} of {len(keys)} tiles")
+    else:
+        written = [_write_one(k) for k in keys]
+    sizes = {k: (size, digest) for k, size, digest in written}
+    name = ""
+    if area.overview_cell > 0:
+        name = "overview.bin"
+        write_overview(out / name, build_overview(area, osm, painted, dem, datum))
+        say("overview written")
+    write_manifest(out / "manifest.txt", area, datum, sizes, streets, name)
+    return {"tiles": len(tiles), "written": len(sizes), "buildings": sum(len(t.footprints) for t in tiles.values()),
+            "trees": sum(len(t.trees) for t in tiles.values()), "bytes": sum(size for size, _ in sizes.values()),
+            "overview_bytes": (out / name).stat().st_size if name else 0, **stats}

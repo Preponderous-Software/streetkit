@@ -4,7 +4,9 @@ Walkable 3D towns from open data. streetkit turns OpenStreetMap, USGS elevation 
 streamed tiles, and gives a game the C++ to load them, walk, ride and fly through them, and draw them with
 [Strata](https://github.com/Preponderous-Software/strata).
 
-It was taken out of [Old Town Walk](https://github.com/dmccoystephenson/old-town-walk), which is built on it.
+It was taken out of [Old Town Walk](https://github.com/dmccoystephenson/old-town-walk), which is built on it, and
+the city features came from [Ponderosa](https://github.com/Preponderous-Software/ponderosa), which maps all of Fort
+Collins.
 
 ## What it does
 
@@ -20,6 +22,12 @@ It was taken out of [Old Town Walk](https://github.com/dmccoystephenson/old-town
 - **Walls and colours.** Windows by storey, shop fronts on commercial streets, parapets and cornices. Roof colours can
   be sampled from aerial imagery (`streetkit roofs`), one colour a building, with the imagery itself never kept.
 - **Trees** from the lidar, at their measured height and crown width.
+- **Whole cities.** An area can name an OpenStreetMap boundary instead of a square: its tiles are the ones within a
+  margin of it, its map comes from a dated regional `.osm.pbf` extract (the `city` extra), its elevation is fetched
+  in 5 km pieces and joined, and its raw data is pinned by URL and hash in `city/SOURCES.json` instead of committed.
+  Builds use every core, can write one tile in N to measure, and resume after an interruption.
+- **An overview.** With `overview_cell_m`, the whole area is also written at low resolution, and the C++ draws it as
+  Strata's terrain under the tiles, so flight sees land all the way to the horizon.
 - **Tiles.** A global grid of UTM squares, each tile self-contained, with a manifest listing every tile by size and
   hash. The format is documented at the top of `streetkit/tiles.py` and read by `src/tile.cpp`.
 - **C++.** `include/streetkit/`: the tile and manifest reader, which tiles to stream, a walker that walks, jumps, flies
@@ -31,7 +39,8 @@ A game keeps its area and data and calls streetkit for the rest.
 
 ```
 my-game/
-  area.json        # {"name", "centre_lat", "centre_lon", "tile_size_m", "tiles_across", "cell_m"}
+  area.json        # {"name", "centre_lat", "centre_lon", "tile_size_m", "tiles_across", "cell_m"}, and optionally
+                   # "overview_cell_m", "lidar_survey", or for a city "boundary_relation", "margin_m", "osm_extract"
   data/raw/        # what `streetkit fetch | sanitize | lidar | roofs` write, committed with SOURCES.json
   data/landmarks.csv, data/building-overrides.csv   # optional
 ```
@@ -43,6 +52,9 @@ uv add "streetkit @ git+https://github.com/Preponderous-Software/streetkit@<comm
 uv run streetkit verify
 uv run streetkit build          # -> build/tiles
 ```
+
+For a city, add the `city` extra: `uv run --extra city streetkit fetch --area city.json`, then `verify` and `build`
+(to `build/<name>`, with `--resume` after an interruption and `--sample N` to try one tile in N).
 
 C++, with CMake 3.24 or newer:
 

@@ -50,8 +50,22 @@ struct Tile {
     float heightAt(float x, float z) const;
 };
 
+// The whole area at low resolution, drawn under the tiles so flight sees land beyond them. Rows run from the north.
+struct Overview {
+    int cols = 0, rows = 0;
+    float cell = 0;
+    double east = 0, north = 0;       // UTM of the first sample
+    std::vector<float> heights;       // cols * rows, metres above the manifest's datum
+    std::vector<uint8_t> colors;      // cols * rows * 3 sRGB
+    bool empty() const { return heights.empty(); }
+    bool covers(double e, double n) const {
+        return !empty() && e >= east && n <= north && e <= east + cell * (cols - 1) && n >= north - cell * (rows - 1);
+    }
+    float heightAt(double e, double n) const;
+};
+
 struct Manifest {
-    std::string name, dir;
+    std::string name, dir, overview;  // overview: its file's name in dir, or empty
     float tileSize = 0, cell = 0, datum = 0;
     double latitude = 0, startEast = 0, startNorth = 0;
     std::vector<TileKey> tiles;
@@ -66,5 +80,7 @@ bool loadTile(const std::string& path, Tile& out, std::string* error);
 // The same from bytes already in memory: a browser downloads what a desktop reads.
 bool parseManifest(const std::string& text, const std::string& dir, Manifest& out);
 bool parseTile(const uint8_t* data, size_t size, Tile& out, std::string* error);
+bool loadOverview(const std::string& path, Overview& out, std::string* error);
+bool parseOverview(const uint8_t* data, size_t size, Overview& out, std::string* error);
 
 }  // namespace streetkit

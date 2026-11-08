@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Python
-        run: uv run --python 3.12 pytest -q
+        run: uv run --python 3.12 --extra city pytest -q   # city: the extract reader too
       - name: Fixture tiles
         run: uv run --python 3.12 python tests/make_fixture.py build/fixture
       - name: C++
