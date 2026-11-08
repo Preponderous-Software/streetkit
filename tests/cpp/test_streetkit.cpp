@@ -534,6 +534,15 @@ static void testFiles() {
     }
 }
 
+static void testPacing() {
+    CHECK(streetkit::loadDue(0.2f, false) && !streetkit::loadDue(0.01f, false) && streetkit::loadDue(0.01f, true));
+    float nearPlane, farPlane;
+    streetkit::clipPlanes(1.65f, nearPlane, farPlane);
+    CHECK(nearPlane == 0.1f);
+    streetkit::clipPlanes(400, nearPlane, farPlane);
+    CHECK(nearPlane == 20.0f && farPlane > 30000);
+}
+
 static void testOverview() {
     // An overview in memory, as tiles.py writes it: 3 x 2 samples 10 m apart from (1000, 2000), heights 0..5.
     std::string bytes("PDROVER1", 8);
@@ -581,6 +590,7 @@ int main(int argc, char** argv) {
     if (argc > 1) tilesDir = argv[1];
     testFindTiles();
     testOverview();
+    testPacing();
     testStreaming();
     testWalking();
     testFiles();
